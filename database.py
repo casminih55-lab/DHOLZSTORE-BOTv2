@@ -33,12 +33,24 @@ def normalize_payment_method(method: str | None) -> str:
 
 @asynccontextmanager
 async def get_db() -> aiosqlite.Connection:
-    """Buka koneksi database (row_factory diset ke dict-like)."""
-    os.makedirs(os.path.dirname(config.DATABASE_PATH), exist_ok=True)
-    db = aiosqlite.connect(config.DATABASE_PATH)
-    async with db as conn:
+    """Buka koneksi database (row_factory diset ke dict-like).
+
+    Safe pattern: create directory only if needed, await aiosqlite.connect,
+    set row_factory, yield connection, and close on exit.
+    """
+    dirname = os.path.dirname(config.DATABASE_PATH)
+    if dirname:
+        os.makedirs(dirname, exist_ok=True)
+
+    conn = await aiosqlite.connect(config.DATABASE_PATH)
+    try:
         conn.row_factory = aiosqlite.Row
         yield conn
+    finally:
+        try:
+            await conn.close()
+        except Exception:
+            pass
 
 
 async def init_db() -> None:
@@ -114,11 +126,12 @@ async def init_db() -> None:
             """
         )
         await db.commit()
+
         # Pastikan kolom baru untuk fitur pembayaran ada (migrasi ringan)
-        # Tambahkan kolom jika belum ada agar tidak merusak database lama
         async with db.execute("PRAGMA table_info(tickets)") as cur:
             rows = await cur.fetchall()
             cols = {r[1] for r in rows}
+
         # Kolom yang kita perlukan: payment_method, order_status, total_idr
         if "payment_method" not in cols:
             await db.execute("ALTER TABLE tickets ADD COLUMN payment_method TEXT")
@@ -209,7 +222,7 @@ async def get_all_payment_methods() -> list[dict]:
             return [dict(r) for r in await cur.fetchall()]
 
 
-# ── Produk ────────────────────────────────────────────────────────────────────
+# ── Produk ────────────────────────────────────────────────────────────
 
 async def get_all_products(active_only: bool = True) -> list[dict]:
     async with get_db() as db:
@@ -278,7 +291,7 @@ async def delete_product(product_id: int) -> bool:
     return True
 
 
-# ── Pesanan ───────────────────────────────────────────────────────────────────
+# ── Pesanan ────────────────────────────────────────────────────────────
 
 async def create_order(
     user_id: str,
@@ -363,7 +376,7 @@ async def update_order_status(order_id: int, status: str) -> bool:
     return True
 
 
-# ── Activity Log ──────────────────────────────────────────────────────────────
+# ── Activity Log ─────────────────────────────────────────────────────────
 
 async def log_activity(
     admin_id: str, action: str, target: str = "", details: str = ""
@@ -376,7 +389,7 @@ async def log_activity(
         await db.commit()
 
 
-# ── Tickets ───────────────────────────────────────────────────────────────────
+# ── Tickets ────────────────────────────────────────────────────────────
 
 async def count_active_tickets(user_id: str) -> int:
     """Hitung ticket aktif (open/claimed) milik user."""
@@ -446,267 +459,3 @@ async def get_active_tickets() -> list[dict]:
             "SELECT * FROM tickets WHERE status IN ('open', 'claimed') ORDER BY id ASC"
         ) as cur:
             return [dict(r) for r in await cur.fetchall()]
-
-
-async def get_user_tickets(user_id: str, limit: int = 10) -> list[dict]:
-    """Ambil ticket milik satu user (terbaru duluan)."""
-    async with get_db() as db:
-        async with db.execute(
-            "SELECT * FROM tickets WHERE user_id = ? ORDER BY created_at DESC LIMIT ?",
-            (user_id, limit),
-        ) as cur:
-            return [dict(r) for r in await cur.fetchall()]
-
-
-async def get_all_tickets(status: str | None = None, limit: int = 25) -> list[dict]:
-    """Ambil semua ticket dengan filter status opsional."""
-    async with get_db() as db:
-        if status:
-            query = "SELECT * FROM tickets WHERE status = ? ORDER BY created_at DESC LIMIT ?"
-            params: tuple = (status, limit)
-        else:
-            query = "SELECT * FROM tickets ORDER BY created_at DESC LIMIT ?"
-            params = (limit,)
-        async with db.execute(query, params) as cur:
-            return [dict(r) for r in await cur.fetchall()]
-
-
-async def get_ticket_transactions(status: str | None = None, buyer_query: str | None = None, limit: int = 25) -> list[dict]:
-    """Ambil riwayat transaksi ticket dengan filter status dan buyer opsional."""
-    async with get_db() as db:
-        clauses: list[str] = []
-        params: list[Any] = []
-
-        if status and status.lower() not in ("all", ""):
-            normalized = status.lower()
-            if normalized == "pending":
-                normalized = config.TICKET_ORDER_STATUS_WAITING
-            clauses.append("order_status = ?")
-            params.append(normalized)
-
-        if buyer_query:
-            query_text = buyer_query.strip()
-            if query_text.startswith("<@") and query_text.endswith(">"):
-                query_text = query_text.strip("<@!>")
-            if query_text.isdigit():
-                clauses.append("(user_id = ? OR username LIKE ?)")
-                params.extend([query_text, f"%{query_text}%"])
-            else:
-                clauses.append("username LIKE ?")
-                params.append(f"%{query_text}%")
-
-        query = "SELECT * FROM tickets"
-        if clauses:
-            query += " WHERE " + " AND ".join(clauses)
-        query += " ORDER BY created_at DESC LIMIT ?"
-        params.append(limit)
-
-        async with db.execute(query, tuple(params)) as cur:
-            return [dict(r) for r in await cur.fetchall()]
-
-
-async def claim_ticket(ticket_id: int, handler_id: str, handler_username: str) -> None:
-    """Tandai ticket sebagai claimed oleh handler."""
-    async with get_db() as db:
-        await db.execute(
-            """
-            UPDATE tickets
-            SET status = 'claimed', handler_id = ?, handler_username = ?
-            WHERE id = ?
-            """,
-            (handler_id, handler_username, ticket_id),
-        )
-        await db.commit()
-
- 
-async def set_ticket_payment(ticket_id: int, payment_method: str, total_idr: float, order_status: str) -> None:
-    """Simpan metode pembayaran, total, dan status order pada ticket."""
-    method_key = normalize_payment_method(payment_method)
-    async with get_db() as db:
-        await db.execute(
-            "UPDATE tickets SET payment_method = ?, total_idr = ?, order_status = ? WHERE id = ?",
-            (method_key, float(total_idr), order_status, ticket_id),
-        )
-        await db.commit()
-
-
-async def set_ticket_proof(ticket_id: int, proof_url: str) -> None:
-    """Simpan URL bukti pembayaran dan timestamp unggahan."""
-    async with get_db() as db:
-        await db.execute(
-            "UPDATE tickets SET proof_url = ?, proof_uploaded_at = datetime('now') WHERE id = ?",
-            (proof_url, ticket_id),
-        )
-        await db.commit()
-
-
-async def set_ticket_product(ticket_id: int, product_id: int, product_name: str, price_idr: float) -> None:
-    """Simpan referensi produk dan harga pada ticket."""
-    async with get_db() as db:
-        await db.execute(
-            "UPDATE tickets SET product_id = ?, product_name = ?, price_idr = ? WHERE id = ?",
-            (product_id, product_name, float(price_idr), ticket_id),
-        )
-        await db.commit()
-
-
-async def set_ticket_verified(ticket_id: int, verifier_id: str, verifier_name: str) -> None:
-    """Tandai ticket sebagai verified dan catat admin serta waktu verifikasi."""
-    async with get_db() as db:
-        await db.execute(
-            "UPDATE tickets SET order_status = ?, verified_by = ?, verified_at = datetime('now') WHERE id = ?",
-            ("verified", verifier_name, ticket_id),
-        )
-        # juga set handler jika belum ada
-        await db.execute(
-            "UPDATE tickets SET handler_id = COALESCE(handler_id, ?), handler_username = COALESCE(handler_username, ?) WHERE id = ?",
-            (verifier_id, verifier_name, ticket_id),
-        )
-        await db.commit()
-
-
-async def set_ticket_rejected(ticket_id: int, reason: str | None, admin_id: str, admin_name: str) -> None:
-    """Tandai ticket sebagai rejected, simpan alasan dan admin yang menolak."""
-    async with get_db() as db:
-        await db.execute(
-            "UPDATE tickets SET order_status = ?, rejected_reason = ?, verified_by = ?, verified_at = datetime('now') WHERE id = ?",
-            ("rejected", reason or "", admin_name, ticket_id),
-        )
-        await db.execute(
-            "UPDATE tickets SET handler_id = COALESCE(handler_id, ?), handler_username = COALESCE(handler_username, ?) WHERE id = ?",
-            (admin_id, admin_name, ticket_id),
-        )
-        await db.commit()
-
-
-async def set_ticket_done(ticket_id: int, admin_id: str, admin_name: str) -> None:
-    """Tandai ticket sebagai done dan catat waktu selesai serta handler jika perlu."""
-    async with get_db() as db:
-        await db.execute(
-            "UPDATE tickets SET order_status = ?, completed_at = datetime('now'), verified_by = ? WHERE id = ?",
-            ("done", admin_name, ticket_id),
-        )
-        await db.execute(
-            "UPDATE tickets SET handler_id = COALESCE(handler_id, ?), handler_username = COALESCE(handler_username, ?) WHERE id = ?",
-            (admin_id, admin_name, ticket_id),
-        )
-        await db.commit()
-
-
-async def create_transaction_from_ticket(ticket_id: int, status: str = "done") -> int:
-    """Buat entri transaksi ringkas di tabel `transactions` berdasarkan data ticket saat ini.
-
-    Mengembalikan ID transaksi yang dibuat.
-    """
-    ticket = await get_ticket(ticket_id)
-    if not ticket:
-        return 0
-    async with get_db() as db:
-        cur = await db.execute(
-            "INSERT INTO transactions (ticket_id, user_id, username, robux_amount, total_idr, payment_method, verified_by, verified_at, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                ticket_id,
-                ticket.get("user_id"),
-                ticket.get("username"),
-                ticket.get("robux_amount"),
-                float(ticket.get("total_idr") or 0),
-                ticket.get("payment_method"),
-                ticket.get("verified_by"),
-                ticket.get("verified_at"),
-                status,
-            ),
-        )
-        await db.commit()
-        return cur.lastrowid  # type: ignore[return-value]
-
-
-async def get_transaction_id_for_ticket(ticket_id: int) -> int | None:
-    async with get_db() as db:
-        async with db.execute(
-            "SELECT id FROM transactions WHERE ticket_id = ? ORDER BY created_at DESC LIMIT 1",
-            (ticket_id,),
-        ) as cur:
-            row = await cur.fetchone()
-            return int(row[0]) if row else None
-
-
-async def find_done_ticket_for_vouch(
-    buyer_id: str,
-    handler_id: str,
-    robux_amount: int,
-    ticket_type: str,
-) -> dict | None:
-    async with get_db() as db:
-        async with db.execute(
-            "SELECT * FROM tickets WHERE user_id = ? AND handler_id = ? AND robux_amount = ? AND ticket_type = ? AND order_status = ? ORDER BY completed_at DESC LIMIT 1",
-            (buyer_id, handler_id, robux_amount, ticket_type, config.TICKET_ORDER_STATUS_DONE),
-        ) as cur:
-            row = await cur.fetchone()
-            return dict(row) if row else None
-
-
-async def get_vouch_by_ticket(ticket_id: int) -> dict | None:
-    async with get_db() as db:
-        async with db.execute(
-            "SELECT * FROM vouches WHERE ticket_id = ?",
-            (ticket_id,),
-        ) as cur:
-            row = await cur.fetchone()
-            return dict(row) if row else None
-
-
-async def create_vouch(
-    ticket_id: int,
-    transaction_id: int | None,
-    buyer_id: str,
-    buyer_username: str,
-    handler_id: str,
-    handler_username: str,
-    robux_amount: int,
-    total_idr: float,
-    payment_method: str | None,
-    via: str,
-) -> int:
-    async with get_db() as db:
-        cur = await db.execute(
-            "INSERT OR IGNORE INTO vouches (ticket_id, transaction_id, buyer_id, buyer_username, handler_id, handler_username, robux_amount, total_idr, payment_method, via, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                ticket_id,
-                transaction_id,
-                buyer_id,
-                buyer_username,
-                handler_id,
-                handler_username,
-                robux_amount,
-                float(total_idr),
-                payment_method or "",
-                via,
-                config.TICKET_ORDER_STATUS_DONE,
-            ),
-        )
-        await db.commit()
-        return cur.lastrowid  # type: ignore[return-value]
-
-
-async def set_ticket_order_status(ticket_id: int, order_status: str) -> None:
-    """Update hanya order_status kolom pada ticket."""
-    async with get_db() as db:
-        await db.execute(
-            "UPDATE tickets SET order_status = ? WHERE id = ?",
-            (order_status, ticket_id),
-        )
-        await db.commit()
-
-
-async def close_ticket(ticket_id: int) -> None:
-    """Tutup ticket dan catat waktu penutupan."""
-    async with get_db() as db:
-        await db.execute(
-            """
-            UPDATE tickets
-            SET status = 'closed', closed_at = datetime('now')
-            WHERE id = ?
-            """,
-            (ticket_id,),
-        )
-        await db.commit()
